@@ -8,8 +8,10 @@ from collections import deque
 import json
 import threading
 import os
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Any
 from dataclasses import dataclass
+import cv2
+from scipy.spatial import KDTree
 
 # 初始化pygame
 pygame.init()
@@ -19,7 +21,7 @@ pygame.font.init()
 SCREEN_WIDTH = 1200
 SCREEN_HEIGHT = 800
 screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
-pygame.display.set_caption("自动驾驶仿真系统")
+pygame.display.set_caption("自动驾驶仿真系统 - 带PID控制")
 
 # 颜色定义
 BLACK = (0, 0, 0)
@@ -37,6 +39,8 @@ MAGENTA = (255, 0, 255)
 ORANGE = (255, 165, 0)
 LIGHT_BLUE = (173, 216, 230)
 PURPLE = (128, 0, 128)
+DARK_GREEN = (0, 100, 0)
+LIGHT_GREEN = (144, 238, 144)
 
 
 # 字体设置 - 使用系统字体或指定中文字体文件
@@ -110,12 +114,32 @@ class SensorType(Enum):
     CAMERA = 0
     LIDAR = 1
     RADAR = 2
+    GPS = 3
+    IMU = 4
 
 
 class PredictionType(Enum):
     CONSTANT_VELOCITY = 0
     CONSTANT_ACCELERATION = 1
     MANEUVERING = 2
+
+
+class SLAMState(Enum):
+    INITIALIZING = 0
+    TRACKING = 1
+    LOST = 2
+
+
+class BEVViewMode(Enum):
+    NORMAL = 0
+    OCCUPANCY_GRID = 1
+    ELEVATION = 2
+
+
+class PIDControllerType(Enum):
+    SPEED = 0
+    STEERING = 1
+    BRAKE = 2
 
 
 # 数据类定义
@@ -134,6 +158,111 @@ class TrackedObject:
     def __post_init__(self):
         if self.prediction_horizon is None:
             self.prediction_horizon = []
+
+
+# PID控制器类
+class PIDController:
+    def __init__(self, kp=1.0, ki=0.0, kd=0.0, integral_limit=10.0, output_limit=1.0,
+                 controller_type=PIDControllerType.SPEED):
+        self.kp = kp  # 比例系数
+        self.ki = ki  # 积分系数
+        self.kd = kd  # 微分系数
+        self.integral_limit = integral_limit  # 积分限幅
+        self.output_limit = output_limit  # 输出限幅
+        self.controller_type = controller_type  # 控制器类型
+
+        # 状态变量
+        self.previous_error = 0.0
+        self.integral = 0.0
+        self.previous_time = time.time()
+        self.output = 0.0
+
+        # 调试信息
+        self.debug_info = {
+            "error": 0.0,
+            "p_term": 0.0,
+            "i_term": 0.0,
+            "d_term": 0.0
+        }
+
+    def reset(self):
+        """重置控制器状态"""
+        self.previous_error = 0.0
+        self.integral = 0.0
+        self.previous_time = time.time()
+        self.output = 0.0
+
+        # 重置调试信息
+        self.debug_info = {
+            "error": 0.0,
+            "p_term": 0.0,
+            "i_term": 0.0,
+            "d_term": 0.0
+        }
+
+    def update(self, setpoint, process_variable, dt=None):
+        """更新PID控制器
+
+        Args:
+            setpoint: 设定值
+            process_variable: 过程变量（当前值）
+            dt: 时间步长（秒），如果为None则自动计算
+
+        Returns:
+            output: 控制器输出
+        """
+        # 计算时间步长
+        current_time = time.time()
+        if dt is None:
+            dt = current_time - self.previous_time
+            if dt <= 0:
+                dt = 0.01  # 默认时间步长
+        self.previous_time = current_time
+
+        # 计算误差
+        error = setpoint - process_variable
+
+        # 比例项
+        p_term = self.kp * error
+
+        # 积分项（带限幅）
+        self.integral += error * dt
+        # 积分抗饱和
+        if self.integral > self.integral_limit:
+            self.integral = self.integral_limit
+        elif self.integral < -self.integral_limit:
+            self.integral = -self.integral_limit
+        i_term = self.ki * self.integral
+
+        # 微分项
+        d_error = (error - self.previous_error) / dt if dt > 0 else 0
+        d_term = self.kd * d_error
+
+        # 保存当前误差用于下一次计算
+        self.previous_error = error
+
+        # 计算输出
+        self.output = p_term + i_term + d_term
+
+        # 输出限幅
+        if self.output > self.output_limit:
+            self.output = self.output_limit
+        elif self.output < -self.output_limit:
+            self.output = -self.output_limit
+
+        # 保存调试信息
+        self.debug_info = {
+            "error": error,
+            "p_term": p_term,
+            "i_term": i_term,
+            "d_term": d_term
+        }
+
+        return self.output
+
+    def get_debug_info(self):
+        """获取调试信息"""
+        return self.debug_info
 
 
 # 向量计算类
@@ -181,11 +310,109 @@ class Vector2:
     def dot(self, other):
         return self.x * other.x + self.y * other.y
 
+    def cross(self, other):
+        return self.x * other.y - self.y * other.x
+
     def distance_to(self, other):
         return math.sqrt((self.x - other.x) ** 2 + (self.y - other.y) ** 2)
 
     def angle_to(self, other):
         return math.degrees(math.atan2(other.y - self.y, other.x - self.x))
+
+    def to_numpy(self):
+        return np.array([self.x, self.y])
+
+
+# 3D向量类
+class Vector3:
+    def __init__(self, x=0.0, y=0.0, z=0.0):
+        self.x = x
+        self.y = y
+        self.z = z
+
+    def __add__(self, other):
+        return Vector3(self.x + other.x, self.y + other.y, self.z + other.z)
+
+    def __sub__(self, other):
+        return Vector3(self.x - other.x, self.y - other.y, self.z - other.z)
+
+    def __mul__(self, scalar):
+        return Vector3(self.x * scalar, self.y * scalar, self.z * scalar)
+
+    def __truediv__(self, scalar):
+        return Vector3(self.x / scalar, self.y / scalar, self.z / scalar)
+
+    def __repr__(self):
+        return f"Vector3({self.x:.2f}, {self.y:.2f}, {self.z:.2f})"
+
+    def length(self):
+        return math.sqrt(self.x * self.x + self.y * self.y + self.z * self.z)
+
+    def normalized(self):
+        length = self.length()
+        if length > 0:
+            return Vector3(self.x / length, self.y / length, self.z / length)
+        return Vector3()
+
+    def to_tuple(self):
+        return (self.x, self.y, self.z)
+
+    def to_numpy(self):
+        return np.array([self.x, self.y, self.z])
+
+
+# 位姿类（位置和方向）
+class Pose:
+    def __init__(self, position=None, orientation=None):
+        self.position = position if position else Vector3()
+        self.orientation = orientation if orientation else Vector3()  # 欧拉角（roll, pitch, yaw）
+
+    def __repr__(self):
+        return f"Pose(pos={self.position}, orient={self.orientation})"
+
+    def to_matrix(self):
+        """将位姿转换为4x4齐次变换矩阵"""
+        # 计算旋转矩阵（使用欧拉角）
+        roll, pitch, yaw = self.orientation.x, self.orientation.y, self.orientation.z
+
+        cr, sr = math.cos(roll), math.sin(roll)
+        cp, sp = math.cos(pitch), math.sin(pitch)
+        cy, sy = math.cos(yaw), math.sin(yaw)
+
+        # ZYX旋转顺序
+        rotation = np.array([
+            [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+            [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+            [-sp, cp * sr, cp * cr]
+        ])
+
+        # 构建齐次变换矩阵
+        transform = np.eye(4)
+        transform[:3, :3] = rotation
+        transform[:3, 3] = [self.position.x, self.position.y, self.position.z]
+
+        return transform
+
+    def from_matrix(self, matrix):
+        """从4x4齐次变换矩阵恢复位姿"""
+        self.position = Vector3(matrix[0, 3], matrix[1, 3], matrix[2, 3])
+
+        # 从旋转矩阵提取欧拉角（ZYX顺序）
+        sy = math.sqrt(matrix[0, 0] ** 2 + matrix[1, 0] ** 2)
+        singular = sy < 1e-6
+
+        if not singular:
+            roll = math.atan2(matrix[2, 1], matrix[2, 2])
+            pitch = math.atan2(-matrix[2, 0], sy)
+            yaw = math.atan2(matrix[1, 0], matrix[0, 0])
+        else:
+            roll = math.atan2(-matrix[1, 2], matrix[1, 1])
+            pitch = math.atan2(-matrix[2, 0], sy)
+            yaw = 0
+
+        self.orientation = Vector3(roll, pitch, yaw)
+
+        return self
 
 
 # 卡尔曼滤波器类
@@ -457,7 +684,7 @@ class SensorFusion:
         tracked_obj.prediction_horizon = self.trajectory_predictor.predict_trajectory(
             tracked_obj.position,
             tracked_obj.velocity,
-            tracked_obj.acceleration,
+            Vector2(0, 0),
             prediction_type=PredictionType.CONSTANT_ACCELERATION
         )
 
@@ -495,7 +722,7 @@ class SensorFusion:
                     collision_time = i * self.trajectory_predictor.time_step
 
                 # 如果距离小于安全距离，标记为碰撞风险
-                if distance < safety_distance:
+                if distance<safety_distance:
                     collision_risks.append({
                         'object_id': obj_id,
                         'object_type': tracked_obj.object_type,
@@ -527,6 +754,601 @@ class Detection:
         self.size = size
         self.confidence = confidence
 
+
+# SLAM系统类
+class SLAMSystem:
+    def __init__(self, map_size=(800, 800), grid_size=0.5):
+        self.map_size = map_size  # 地图尺寸 (宽度, 高度)
+        self.grid_size = grid_size  # 网格大小（米）
+
+        # 初始化地图
+        self.occupancy_grid = np.zeros((map_size[1], map_size[0]), dtype=np.float32)
+        self.elevation_map = np.zeros((map_size[1], map_size[0]), dtype=np.float32)
+
+        # 初始化位姿
+        self.current_pose = Pose(Vector3(map_size[0] // 2, map_size[1] // 2, 0), Vector3(0, 0, 0))
+        self.estimated_pose = self.current_pose
+
+        # 地标和特征点
+        self.landmarks = []  # 存储地标位置
+        self.landmark_descriptors = []  # 存储地标特征描述符
+        self.landmark_covariances = []  # 存储地标协方差
+
+        # 粒子滤波器用于定位
+        self.num_particles = 100
+        self.particles = []  # 粒子列表，每个粒子是一个位姿
+        self.particle_weights = np.ones(self.num_particles) / self.num_particles
+
+        # 状态
+        self.state = SLAMState.INITIALIZING
+        self.initialization_counter = 0
+
+        # 建图参数
+        self.map_update_rate = 0.1  # 地图更新率
+        self.observation_range = 50  # 观测范围（像素）
+
+        # 创建KD树用于快速特征匹配
+        self.landmark_tree = None
+        self.update_landmark_tree()
+
+    def update_landmark_tree(self):
+        """更新地标KD树"""
+        if self.landmarks:
+            points = np.array([(lm.x, lm.y) for lm in self.landmarks])
+            self.landmark_tree = KDTree(points)
+        else:
+            self.landmark_tree = None
+
+    def predict(self, linear_velocity, angular_velocity, dt):
+        """预测步骤：根据运动模型更新位姿估计"""
+        # 更新当前位姿（真实位姿，仅用于仿真）
+        self.current_pose.position.x += linear_velocity * math.cos(self.current_pose.orientation.z) * dt
+        self.current_pose.position.y += linear_velocity * math.sin(self.current_pose.orientation.z) * dt
+        self.current_pose.orientation.z += angular_velocity * dt
+
+        # 更新估计位姿（带有噪声）
+        noise_scale = 0.1
+        estimated_linear_velocity = linear_velocity + random.gauss(0, noise_scale)
+        estimated_angular_velocity = angular_velocity + random.gauss(0, noise_scale * 0.1)
+
+        self.estimated_pose.position.x += estimated_linear_velocity * math.cos(self.estimated_pose.orientation.z) * dt
+        self.estimated_pose.position.y += estimated_linear_velocity * math.sin(self.estimated_pose.orientation.z) * dt
+        self.estimated_pose.orientation.z += estimated_angular_velocity * dt
+
+        # 更新粒子滤波器
+        self.update_particles(linear_velocity, angular_velocity, dt)
+
+    def update_particles(self, linear_velocity, angular_velocity, dt):
+        """更新粒子滤波器"""
+        for i in range(len(self.particles)):
+            # 添加运动噪声
+            noisy_linear = linear_velocity + random.gauss(0, 0.1)
+            noisy_angular = angular_velocity + random.gauss(0, 0.01)
+            #print(self.particles)
+            # 更新粒子位姿
+            self.particles[i].position.x += noisy_linear * math.cos(self.particles[i].orientation.z) * dt
+            self.particles[i].position.y += noisy_linear * math.sin(self.particles[i].orientation.z) * dt
+            self.particles[i].orientation.z += noisy_angular * dt
+
+    def update(self, observations):
+        """更新步骤：根据观测更新地图和位姿估计"""
+        if self.state == SLAMState.INITIALIZING:
+            self.initialization_counter += 1
+            if self.initialization_counter > 10:  # 初始化完成
+                self.state = SLAMState.TRACKING
+                # 初始化粒子滤波器
+                self.initialize_particles()
+            return
+
+        # 提取观测中的特征点
+        observed_features = self.extract_features(observations)
+
+        # 数据关联：将观测特征与地图中的地标匹配
+        matches = self.data_association(observed_features)
+
+        # 更新地标
+        self.update_landmarks(observed_features, matches)
+
+        # 更新位姿估计
+        self.update_pose_estimation(observed_features, matches)
+
+        # 更新地图
+        self.update_map(observations)
+
+        # 重采样粒子
+        self.resample_particles()
+
+    def initialize_particles(self):
+        """初始化粒子滤波器"""
+        self.particles = []
+        for _ in range(self.num_particles):
+            # 在初始位姿周围随机分布粒子
+            noise_pos = random.gauss(0, 10)  # 位置噪声
+            noise_angle = random.gauss(0, 0.1)  # 角度噪声
+
+            particle = Pose(
+                Vector3(
+                    self.estimated_pose.position.x + noise_pos,
+                    self.estimated_pose.position.y + noise_pos,
+                    self.estimated_pose.position.z
+                ),
+                Vector3(
+                    self.estimated_pose.orientation.x,
+                    self.estimated_pose.orientation.y,
+                    self.estimated_pose.orientation.z + noise_angle
+                )
+            )
+            self.particles.append(particle)
+
+    def extract_features(self, observations):
+        """从观测中提取特征点（简化版）"""
+        features = []
+        for obs in observations:
+            # 简化特征提取：直接将观测位置作为特征
+            features.append({
+                'position': obs.position,
+                'descriptor': np.random.rand(10)  # 随机特征描述符
+            })
+        return features
+
+    def data_association(self, observed_features):
+        """数据关联：将观测特征与地图中的地标匹配"""
+        matches = []
+
+        if not self.landmark_tree or not observed_features:
+            return matches
+
+        # 获取观测特征的位置
+        observed_positions = np.array([(f['position'].x, f['position'].y) for f in observed_features])
+
+        # 使用KD树查找最近邻
+        distances, indices = self.landmark_tree.query(observed_positions, k=1)
+
+        # 创建匹配对
+        for i, (dist, idx) in enumerate(zip(distances, indices)):
+            if dist < 20.0:  # 匹配阈值
+                matches.append({
+                    'observed_idx': i,
+                    'landmark_idx': idx,
+                    'distance': dist
+                })
+
+        return matches
+
+    def update_landmarks(self, observed_features, matches):
+        """更新地标"""
+        # 更新已匹配的地标
+        for match in matches:
+            obs_idx = match['observed_idx']
+            lm_idx = match['landmark_idx']
+
+            # 简化更新：移动地标位置向观测位置靠近
+            alpha = 0.1  # 学习率
+            observed_pos = observed_features[obs_idx]['position']
+            self.landmarks[lm_idx] = self.landmarks[lm_idx] * (1 - alpha) + observed_pos * alpha
+
+        # 添加新的地标
+        matched_obs_indices = [m['observed_idx'] for m in matches]
+        for i, feature in enumerate(observed_features):
+            if i not in matched_obs_indices:
+                self.landmarks.append(feature['position'])
+                self.landmark_descriptors.append(feature['descriptor'])
+                self.landmark_covariances.append(np.eye(2) * 10.0)  # 初始协方差
+
+        # 更新KD树
+        self.update_landmark_tree()
+
+    def update_pose_estimation(self, observed_features, matches):
+        """更新位姿估计"""
+        if not matches:
+            return
+
+        # 计算位姿更新（简化版）
+        # 在实际SLAM中，这里会使用扩展卡尔曼滤波器或图优化
+
+        # 更新粒子权重
+        for i in range(self.num_particles):
+            weight = 1.0
+            for match in matches:
+                obs_idx = match['observed_idx']
+                lm_idx = match['landmark_idx']
+
+                # 计算观测预期位置（基于粒子位姿）
+                expected_obs = self.landmarks[lm_idx] - Vector2(self.particles[i].position.x,
+                                                                self.particles[i].position.y)
+                expected_obs = expected_obs.rotate(-math.degrees(self.particles[i].orientation.z))
+
+                # 计算实际观测位置
+                actual_obs = observed_features[obs_idx]['position']
+
+                # 计算误差
+                error = expected_obs.distance_to(actual_obs)
+
+                # 更新权重（误差越小权重越大）
+                weight *= math.exp(-error * error / (2 * 10.0))  # 高斯分布
+
+            self.particle_weights[i] = weight
+
+        # 归一化权重
+        self.particle_weights /= np.sum(self.particle_weights)
+
+        # 选择最佳粒子作为位姿估计
+        best_particle_idx = np.argmax(self.particle_weights)
+        self.estimated_pose = self.particles[best_particle_idx]
+
+    def resample_particles(self):
+        """重采样粒子"""
+        # 计算有效粒子数
+        effective_particles = 1.0 / np.sum(self.particle_weights ** 2)
+
+        # 如果有效粒子数太少，进行重采样
+        if effective_particles < self.num_particles / 2:
+            # 系统重采样
+            indices = np.random.choice(
+                range(self.num_particles),
+                size=self.num_particles,
+                p=self.particle_weights
+            )
+
+            new_particles = []
+            for idx in indices:
+                # 添加少量噪声以避免粒子退化
+                noise_pos = random.gauss(0, 0.1)
+                noise_angle = random.gauss(0, 0.01)
+
+                new_particle = Pose(
+                    Vector3(
+                        self.particles[idx].position.x + noise_pos,
+                        self.particles[idx].position.y + noise_pos,
+                        self.particles[idx].position.z
+                    ),
+                    Vector3(
+                        self.particles[idx].orientation.x,
+                        self.particles[idx].orientation.y,
+                        self.particles[idx].orientation.z + noise_angle
+                    )
+                )
+                new_particles.append(new_particle)
+
+            self.particles = new_particles
+            self.particle_weights = np.ones(self.num_particles) / self.num_particles
+
+    def update_map(self, observations):
+        """更新占据栅格地图"""
+        # 获取当前位姿
+        pose_x = int(self.estimated_pose.position.x)
+        pose_y = int(self.estimated_pose.position.y)
+        pose_angle = self.estimated_pose.orientation.z
+
+        # 更新观测范围内的网格
+        for obs in observations:
+            # 转换观测到全局坐标系
+            global_obs = Vector2(
+                pose_x + obs.position.x * math.cos(pose_angle) - obs.position.y * math.sin(pose_angle),
+                pose_y + obs.position.x * math.sin(pose_angle) + obs.position.y * math.cos(pose_angle)
+            )
+
+            # 确保坐标在地图范围内
+            map_x = int(global_obs.x)
+            map_y = int(global_obs.y)
+
+            if 0 <= map_x < self.map_size[0] and 0 <= map_y < self.map_size[1]:
+                # 更新占据概率（log odds形式）
+                self.occupancy_grid[map_y, map_x] += math.log(9)  # 占据概率增加
+
+        # 更新车辆当前位置周围的空闲区域
+        for angle in np.linspace(0, 2 * math.pi, 36):
+            for r in range(1, self.observation_range):
+                map_x = int(pose_x + r * math.cos(pose_angle + angle))
+                map_y = int(pose_y + r * math.sin(pose_angle + angle))
+
+                if 0 <= map_x < self.map_size[0] and 0 <= map_y < self.map_size[1]:
+                    # 如果这个位置没有被占据，减少占据概率
+                    if self.occupancy_grid[map_y, map_x] < math.log(9):
+                        self.occupancy_grid[map_y, map_x] -= math.log(9) * 0.1  # 空闲概率增加
+
+                # 如果遇到占据网格，停止更新（假设光线被阻挡）
+                if 0 <= map_x < self.map_size[0] and 0 <= map_y < self.map_size[1]:
+                    if self.occupancy_grid[map_y, map_x] > 0:
+                        break
+
+    def get_occupancy_probability(self, x, y):
+        """获取指定位置的占据概率"""
+        if 0 <= x < self.map_size[0] and 0 <= y < self.map_size[1]:
+            odds = math.exp(self.occupancy_grid[y, x])
+            return odds / (1 + odds)
+        return 0.5  # 未知区域
+
+    def draw(self, screen, offset_x=0, offset_y=0, scale=1.0):
+        """绘制SLAM地图"""
+        # 绘制占据栅格地图
+        for y in range(0, self.map_size[1], 5):
+            for x in range(0, self.map_size[0], 5):
+                prob = self.get_occupancy_probability(x, y)
+                color_value = int(255 * (1 - prob))  # 占据越大概率颜色越深
+                color = (color_value, color_value, color_value)
+
+                rect = pygame.Rect(
+                    offset_x + x * scale,
+                    offset_y + y * scale,
+                    5 * scale,
+                    5 * scale
+                )
+                pygame.draw.rect(screen, color, rect)
+
+        # 绘制地标
+        for landmark in self.landmarks:
+            pygame.draw.circle(
+                screen,
+                GREEN,
+                (offset_x + int(landmark.x * scale), offset_y + int(landmark.y * scale)),
+                3
+            )
+
+        # 绘制估计位姿
+        pygame.draw.circle(
+            screen,
+            BLUE,
+            (offset_x + int(self.estimated_pose.position.x * scale),
+             offset_y + int(self.estimated_pose.position.y * scale)),
+            5
+        )
+
+        # 绘制方向指示
+        end_x = offset_x + int(
+            self.estimated_pose.position.x * scale + 15 * math.cos(self.estimated_pose.orientation.z) * scale)
+        end_y = offset_y + int(
+            self.estimated_pose.position.y * scale + 15 * math.sin(self.estimated_pose.orientation.z) * scale)
+        pygame.draw.line(
+            screen,
+            BLUE,
+            (offset_x + int(self.estimated_pose.position.x * scale),
+             offset_y + int(self.estimated_pose.position.y * scale)),
+            (end_x, end_y),
+            2
+        )
+
+        # 绘制粒子
+        for particle in self.particles:
+            pygame.draw.circle(
+                screen,
+                (255, 100, 100, 100),  # 半透明红色
+                (offset_x + int(particle.position.x * scale), offset_y + int(particle.position.y * scale)),
+                2
+            )
+
+# BEV系统类
+class BEVSystem:
+    def __init__(self, width=400, height=400, scale=0.5):
+        self.width = width
+        self.height = height
+        self.scale = scale  # 像素/米
+        self.view_mode = BEVViewMode.NORMAL
+        self.surface = pygame.Surface((width, height))
+        self.ego_vehicle = None
+        self.visible_objects = []
+
+    def update(self, ego_vehicle, objects, roads, obstacles, traffic_lights):
+        """更新BEV视图"""
+        self.ego_vehicle = ego_vehicle
+        self.visible_objects = objects
+
+        # 清空表面
+        self.surface.fill(LIGHT_GRAY)
+
+        # 绘制道路
+        for road in roads:
+            self.draw_road(road)
+
+        # 绘制障碍物
+        for obstacle in obstacles:
+            self.draw_obstacle(obstacle)
+
+        # 绘制交通灯
+        for light in traffic_lights:
+            self.draw_traffic_light(light)
+
+        # 绘制其他车辆和行人
+        for obj in objects:
+            if hasattr(obj, 'type') and obj.type in ['vehicle', 'pedestrian']:
+                self.draw_object(obj)
+
+        # 绘制自我车辆
+        self.draw_ego_vehicle(ego_vehicle)
+
+        # 绘制传感器范围
+        self.draw_sensor_range(ego_vehicle)
+
+    def draw_road(self, road):
+        """绘制道路"""
+        # 转换道路坐标到BEV坐标系
+        start_x = int(road.start.x * self.scale)
+        start_y = int(road.start.y * self.scale)
+        end_x = int(road.end.x * self.scale)
+        end_y = int(road.end.y * self.scale)
+        width = int(road.width * self.scale)
+
+        # 计算道路方向向量和法向量
+        dx = end_x - start_x
+        dy = end_y - start_y
+        length = math.sqrt(dx * dx + dy * dy)
+
+        if length == 0:
+            return
+
+        # 归一化方向向量
+        dx /= length
+        dy /= length
+
+        # 计算法向量
+        nx = -dy
+        ny = dx
+
+        # 计算道路边界点
+        half_width = width / 2
+        points = [
+            (start_x + nx * half_width, start_y + ny * half_width),
+            (end_x + nx * half_width, end_y + ny * half_width),
+            (end_x - nx * half_width, end_y - ny * half_width),
+            (start_x - nx * half_width, start_y - ny * half_width)
+        ]
+
+        # 绘制道路
+        pygame.draw.polygon(self.surface, GRAY, points)
+
+        # 绘制车道极地
+        lane_width = width / road.lanes
+        for i in range(1, road.lanes):
+            offset = half_width - i * lane_width
+            line_start = (start_x + nx * offset, start_y + ny * offset)
+            line_end = (end_x + nx * offset, end_y + ny * offset)
+            pygame.draw.line(self.surface, WHITE, line_start, line_end, 1)
+
+        # 绘制道路中心线
+        center_start = (start_x, start_y)
+        center_end = (end_x, end_y)
+        pygame.draw.line(self.surface, YELLOW, center_start, center_end, 2)
+
+    def draw_obstacle(self, obstacle):
+        """绘制障碍物"""
+        x = int(obstacle.position.x * self.scale)
+        y = int(obstacle.position.y * self.scale)
+        width = int(obstacle.size.x * self.scale)
+        height = int(obstacle.size.y * self.scale)
+
+        if obstacle.type == "cone":
+            # 绘制锥形障碍物
+            points = [
+                (x, y - height // 2),
+                (x - width // 2, y + height // 2),
+                (x + width // 2, y + height // 2)
+            ]
+            pygame.draw.polygon(self.surface, ORANGE, points)
+        else:
+            # 绘制矩形障碍物
+            pygame.draw.rect(self.surface, RED, (x - width // 2, y - height // 2, width, height))
+
+    def draw_traffic_light(self, light):
+        """绘制交通灯"""
+        x = int(light.position.x * self.scale)
+        y = int(light.position.y * self.scale)
+
+        # 根据交通灯状态选择颜色
+        if light.state == TrafficLightState.RED:
+            color = RED
+        elif light.state == TrafficLightState.YELLOW:
+            color = YELLOW
+        elif light.state == TrafficLightState.GREEN:
+            color = GREEN
+        else:  # LEFT_GREEN
+            color = GREEN
+
+        pygame.draw.circle(self.surface, color, (x, y), 5)
+
+    def draw_object(self, obj):
+        """绘制其他车辆和行人"""
+        x = int(obj.position.x * self.scale)
+        y = int(obj.position.y * self.scale)
+
+        if obj.object_type == "vehicle":
+            # 绘制车辆
+            width = int(obj.size.x * self.scale)
+            height = int(obj.size.y * self.scale)
+
+            # 创建车辆矩形
+            vehicle_rect = pygame.Rect(0, 0, width, height)
+            vehicle_rect.center = (x, y)
+
+            # 绘制车辆
+            pygame.draw.rect(self.surface, BLUE, vehicle_rect)
+
+            # 绘制方向指示
+            angle_rad = math.radians(getattr(obj, 'angle', 0))
+            end_x = x + int(15 * math.cos(angle_rad))
+            end_y = y + int(15 * math.sin(angle_rad))
+            pygame.draw.line(self.surface, BLACK, (x, y), (end_x, end_y), 2)
+
+        elif obj.object_type == "pedestrian":
+            # 绘制行人
+            pygame.draw.circle(self.surface, MAGENTA, (x, y), 5)
+
+    def draw_ego_vehicle(self, vehicle):
+        """绘制自我车辆"""
+        x = int(vehicle.position.x * self.scale)
+        y = int(vehicle.position.y * self.scale)
+        width = int(vehicle.size.x * self.scale)
+        height = int(vehicle.size.y * self.scale)
+
+        # 创建车辆矩形
+        vehicle_rect = pygame.Rect(0, 0, width, height)
+        vehicle_rect.center = (x, y)
+
+        # 绘制车辆
+        pygame.draw.rect(self.surface, GREEN, vehicle_rect)
+
+        # 绘制方向指示
+        angle_rad = math.radians(vehicle.angle)
+        end_x = x + int(20 * math.cos(angle_rad))
+        end_y = y + int(20 * math.sin(angle_rad))
+        pygame.draw.line(self.surface, BLACK, (x, y), (end_x, end_y), 2)
+
+    def draw_sensor_range(self, vehicle):
+        """绘制传感器范围"""
+        x = int(vehicle.position.x * self.scale)
+        y = int(vehicle.position.y * self.scale)
+
+        # 绘制传感器检测范围
+        for sensor in vehicle.sensors:
+            # 计算传感器位置
+            sensor_pos = vehicle.position + sensor.position.rotate(vehicle.angle)
+            sensor_x = int(sensor_pos.x * self.scale)
+            sensor_y = int(sensor_pos.y * self.scale)
+
+            # 计算传感器方向
+            sensor_angle = math.radians(vehicle.angle + sensor.angle)
+
+            # 计算传感器范围弧线
+            start_angle = sensor_angle - math.radians(sensor.fov / 2)
+            end_angle = sensor_angle + math.radians(sensor.fov / 2)
+
+            # 绘制传感器范围
+            pygame.draw.arc(
+                self.surface,
+                CYAN,
+                (sensor_x - sensor.range * self.scale,
+                 sensor_y - sensor.range * self.scale,
+                 sensor.range * 2 * self.scale,
+                 sensor.range * 2 * self.scale),
+                start_angle,
+                end_angle,
+                1
+            )
+
+            # 绘制传感器位置
+            pygame.draw.circle(self.surface, CYAN, (sensor_x, sensor_y), 3)
+
+    def render(self, screen, x, y):
+        """将BEV视图渲染到主屏幕"""
+        # 绘制BEV视图边框
+        pygame.draw.rect(screen, BLACK, (x - 2, y - 2, self.width + 4, self.height + 4), 2)
+
+        # 绘制BEV视图
+        screen.blit(self.surface, (x, y))
+
+        # 绘制标题
+        title_text = "鸟瞰图 (BEV)"
+        title_surface = font.render(title_text, True, BLACK)
+        screen.blit(title_surface, (x + 10, y + 10))
+
+        # 绘制视图模式
+        mode_text = f"模式: {self.view_mode.name}"
+        mode_surface = font.render(mode_text, True, BLACK)
+        screen.blit(mode_surface, (x + 10, y + 30))
+
+        # 绘制比例尺
+        scale_text = f"比例: 1px = {1 / self.scale:.2f}m"
+        scale_surface = font.render(scale_text, True, BLACK)
+        screen.blit(scale_surface, (x + 10, y + 50))
 
 # 道路类
 class Road:
@@ -592,13 +1414,15 @@ class Road:
         lane_width = self.width / self.lanes
         for i in range(1, self.lanes):
             offset = self.normal * (self.width / 2 - i * lane_width)
-            lane_start = self.start + offset
-            lane_end = self.end + offset
-            pygame.draw.line(screen, WHITE, lane_start.to_tuple(), lane_end.to_tuple(), 2)
+        lane_start = self.start + offset
+        lane_end = self.end + offset
+        pygame.draw.line(screen, WHITE, lane_start.to_tuple(), lane_end.to_tuple(), 2)
 
         # 绘制道路边缘
         pygame.draw.line(screen, WHITE, self.left_boundary[0].to_tuple(), self.left_boundary[1].to_tuple(), 2)
         pygame.draw.line(screen, WHITE, self.right_boundary[0].to_tuple(), self.right_boundary[1].to_tuple(), 2)
+
+        # 交叉口类
 
 
 # 交叉口类
@@ -616,7 +1440,6 @@ class Intersection:
         pygame.draw.circle(screen, BLACK, self.position.to_tuple(), self.radius, 2)
 
 
-# 交通灯类
 class TrafficLight:
     def __init__(self, position, road, direction="horizontal"):
         self.position = position
@@ -715,6 +1538,7 @@ class Pedestrian:
         self.wait_time = 0
         self.velocity = Vector2(0, 0)
         self.acceleration = Vector2(0, 0)
+        self.object_type = "pedestrian"
 
     def update(self, dt, traffic_lights):
         # 保存旧位置用于计算速度
@@ -729,7 +1553,7 @@ class Pedestrian:
                 break
 
         if not self.waiting:
-            # 随机改变方向或设置新目标
+            # 随机改变极地或设置新目标
             if self.target is None or random.random() < 0.005:
                 self.target = Vector2(
                     random.randint(50, SCREEN_WIDTH - 50),
@@ -860,6 +1684,7 @@ class VehicleDynamics:
         drag_force = self.drag_coefficient * self.velocity * abs(self.velocity)
 
         # 计算总力
+        # 计算总力
         total_force = self.engine_force - self.brake_force - drag_force
 
         # 计算加速度
@@ -905,6 +1730,17 @@ class Vehicle:
         self.tracked_objects = []
         self.collision_risks = []
 
+        # SLAM系统
+        self.slam = SLAMSystem()
+
+        # PID控制器
+        self.speed_pid = PIDController(kp=0.5, ki=0.1, kd=0.2, output_limit=1.0,
+                                       controller_type=PIDControllerType.SPEED)
+        self.steering_pid = PIDController(kp=0.8, ki=0.05, kd=0.3, output_limit=1.0,
+                                          controller_type=PIDControllerType.STEERING)
+        self.brake_pid = PIDController(kp=1.0, ki=0.2, kd=0.1, output_limit=1.0,
+                                       controller_type=PIDControllerType.BRAKE)
+
         # 控制参数
         self.target_speed = 0
         self.target_angle = 0
@@ -929,6 +1765,16 @@ class Vehicle:
         self.avoidance_maneuver = None
         self.avoidance_timer = 0
 
+        # 对象类型（用于传感器检测）
+        self.object_type = "vehicle"
+
+        # PID调试信息
+        self.pid_debug_info = {
+            "speed": {"error": 0, "p": 0, "i": 0, "d": 0},
+            "steering": {"error": 0, "p": 0, "i": 0, "d": 0},
+            "brake": {"error": 0, "p": 0, "i": 0, "d": 0}
+        }
+
     def assign_to_road(self, road, lane=0):
         """将车辆分配到指定道路的车道上"""
         self.current_road = road
@@ -949,13 +1795,23 @@ class Vehicle:
         self.tracked_objects = self.sensor_fusion.update(all_detections, current_time)
 
         # 计算碰撞风险
+        #ego_velocity = Vector2(self.dynamics.velocity, 0).rotate(self.angle)
         ego_velocity = Vector2(self.dynamics.velocity, 0).rotate(self.angle)
         self.collision_risks = self.sensor_fusion.get_collision_risk(
             self.position, ego_velocity
         )
 
+        # 更新SLAM系统
+        linear_velocity = self.dynamics.velocity
+        angular_velocity = math.radians(self.dynamics.steering_angle) * linear_velocity / self.size.x
+        self.slam.predict(linear_velocity, angular_velocity, dt)
+        self.slam.update(all_detections)
+
         # 根据传感器数据和预测结果做出决策
         self.make_decision(objects, traffic_lights, roads)
+
+        # 使用PID控制器更新控制输入
+        self.update_pid_controllers(dt)
 
         # 更新动力学
         self.dynamics.update(dt, self.throttle, self.brake, self.steering)
@@ -996,6 +1852,54 @@ class Vehicle:
             if self.avoidance_timer > 5.0:  # 5秒后重置避障行为
                 self.avoidance_maneuver = None
                 self.avoidance_timer = 0
+
+    def update_pid_controllers(self, dt):
+        """使用PID控制器更新控制输入"""
+        # 速度PID控制器
+        throttle_output = self.speed_pid.update(self.target_speed, self.dynamics.velocity, dt)
+        if throttle_output > 0:
+            self.throttle = throttle_output
+            self.brake = 0
+        else:
+            self.throttle = 0
+            # 使用刹车PID控制器
+            self.brake = self.brake_pid.update(0, -throttle_output, dt)
+
+        # 转向PID控制器
+        if self.current_road:
+            # 在道路上行驶时，保持车道中心
+            lane_center = self.current_road.get_lane_center(self.current_lane, self.road_progress)
+            road_direction = self.current_road.get_lane_direction()
+            target_angle = math.degrees(math.atan2(road_direction.y, road_direction.x))
+
+            # 计算横向误差（车辆当前位置到车道中心的距离）
+            lateral_error = (lane_center - self.position).dot(self.current_road.normal)
+
+            # 使用横向误差作为转向PID的输入
+            steering_output = self.steering_pid.update(0, lateral_error, dt)
+            self.steering = steering_output
+        else:
+            # 自由行驶模式下的转向控制
+            if self.path and self.current_waypoint < len(self.path):
+                target_pos = self.path[self.current_waypoint]
+                to_target = target_pos - self.position
+
+                # 计算目标角度
+                target_angle = math.degrees(math.atan2(to_target.y, to_target.x))
+
+                # 计算角度误差
+                angle_error = (target_angle - self.angle) % 360
+                if angle_error > 180:
+                    angle_error -= 360
+
+                # 使用角度误差作为转向PID的输入
+                steering_output = self.steering_pid.update(0, angle_error, dt)
+                self.steering = steering_output
+
+        # 保存PID调试信息
+        self.pid_debug_info["speed"] = self.speed_pid.get_debug_info()
+        self.pid_debug_info["steering"] = self.steering_pid.get_debug_info()
+        self.pid_debug_info["brake"] = self.brake_pid.get_debug_info()
 
     def find_next_road(self, roads):
         """寻找下一段道路"""
@@ -1058,37 +1962,8 @@ class Vehicle:
             # 正常行驶
             self.target_speed = 50  # 目标速度50像素/秒
 
-            # 如果在道路上行驶，保持车道
-            if self.current_road:
-                self.steering = 0
-            else:
-                # 自由行驶模式下的路径跟踪
-                if self.path and self.current_waypoint < len(self.path):
-                    target_pos = self.path[self.current_waypoint]
-                    to_target = target_pos - self.position
-                    dist_to_target = to_target.length()
-
-                    if dist_to_target < 20:
-                        self.current_waypoint += 1
-                        if self.current_waypoint >= len(self.path):
-                            self.current_waypoint = 0
-
-                    # 计算转向角度
-                    target_angle = math.degrees(math.atan2(to_target.y, to_target.x))
-                    angle_diff = (target_angle - self.angle) % 360
-                    if angle_diff > 180:
-                        angle_diff -= 360
-
-                    self.steering = max(-1, min(1, angle_diff / 30))
-
-        # 控制油门和刹车
-        speed_error = self.target_speed - self.dynamics.velocity
-        if speed_error > 0:
-            self.throttle = min(1.0, speed_error / 10)
-            self.brake = 0
-        else:
-            self.throttle = 0
-            self.brake = min(1.0, -speed_error / 10)
+            # 重置避障状态
+            self.avoidance_maneuver = None
 
     def perform_avoidance_maneuver(self):
         """执行避障动作"""
@@ -1117,7 +1992,7 @@ class Vehicle:
 
         # 绘制车轮
         pygame.draw.rect(car_surface, BLACK, (0, 0, self.size.x * 0.2, self.size.y))
-        pygame.draw.rect(car_surface, BLACK, (self.size.x * 0.8, 0, self.size.x * 0.2, self.size.y))
+        pygame.draw.rect(car_surface, BLACK, (self.size.x * 0.8, 0, self.size.x, self.size.y))
 
         # 旋转车辆表面
         rotated_surface = pygame.transform.rotate(car_surface, -self.angle)
@@ -1173,6 +2048,12 @@ class Vehicle:
                 color = GREEN if i == self.current_waypoint else MAGENTA
                 pygame.draw.circle(screen, color, point.to_tuple(), 5)
 
+        # 绘制PID调试信息
+        if hasattr(self, 'pid_debug_info'):
+            pid_text = f"PID: S({self.pid_debug_info['speed']['error']:.1f}) ST({self.pid_debug_info['steering']['error']:.1f}) B({self.pid_debug_info['brake']['error']:.1f})"
+            pid_surface = font.render(pid_text, True, PURPLE)
+            screen.blit(pid_surface, (self.position.x + 20, self.position.y - 30))
+
 
 # 仿真环境类
 class Simulation:
@@ -1190,8 +2071,14 @@ class Simulation:
         self.edit_mode = "road"  # road, vehicle, light, obstacle, pedestrian
         self.show_sensors = True
         self.show_predictions = True
+        self.show_slam = True
+        self.show_bev = True
+        self.show_pid = True
         self.paused = False
         self.simulation_time = 0
+
+        # BEV系统
+        self.bev_system = BEVSystem()
 
         # 创建道路网络
         self.create_road_network()
@@ -1223,13 +2110,13 @@ class Simulation:
             size = Vector2(20, 20)
             self.obstacles.append(Obstacle(pos, size))
 
-        # 创建一些行人
         for i in range(10):
             # 将行人放在人行道上
             road = random.choice(self.roads)
             side = random.choice([-1, 1])
             pos = road.get_lane_center(0, random.random()) + road.normal * (road.width / 2 + 30) * side
             self.pedestrians.append(Pedestrian(pos))
+
 
     def create_road_network(self):
         # 创建水平道路
@@ -1258,6 +2145,7 @@ class Simulation:
                 intersection.add_road(v_road)
                 self.intersections.append(intersection)
 
+
     def handle_events(self):
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -1272,6 +2160,10 @@ class Simulation:
                     self.show_sensors = not self.show_sensors
                 elif event.key == pygame.K_p:
                     self.show_predictions = not self.show_predictions
+                elif event.key == pygame.K_m:
+                    self.show_slam = not self.show_slam
+                elif event.key == pygame.K_b:
+                    self.show_bev = not self.show_bev
                 elif event.key == pygame.K_1:
                     self.edit_mode = "road"
                 elif event.key == pygame.K_2:
@@ -1285,6 +2177,14 @@ class Simulation:
                 elif event.key == pygame.K_l:
                     for light in self.traffic_lights:
                         light.set_left_turn()
+                elif event.key == pygame.K_v:
+                    # 切换BEV视图模式
+                    if self.bev_system.view_mode == BEVViewMode.NORMAL:
+                        self.bev_system.view_mode = BEVViewMode.OCCUPANCY_GRID
+                    elif self.bev_system.view_mode == BEVViewMode.OCCUPANCY_GRID:
+                        self.bev_system.view_mode = BEVViewMode.ELEVATION
+                    else:
+                        self.bev_system.view_mode = BEVViewMode.NORMAL
 
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 mouse_pos = Vector2(*pygame.mouse.get_pos())
@@ -1367,6 +2267,7 @@ class Simulation:
                         # 为选中的车辆添加路径点
                         self.selected_vehicle.path.append(mouse_pos)
 
+
     def update(self):
         if self.paused:
             return
@@ -1386,6 +2287,17 @@ class Simulation:
         all_objects = self.vehicles + self.obstacles + self.pedestrians
         for vehicle in self.vehicles:
             vehicle.update(self.dt, all_objects, self.traffic_lights, self.roads)
+
+        # 更新BEV系统
+        if self.selected_vehicle and self.show_bev:
+            self.bev_system.update(
+                self.selected_vehicle,
+                all_objects,
+                self.roads,
+                self.obstacles,
+                self.traffic_lights
+            )
+
 
     def draw(self):
         # 清屏
@@ -1415,20 +2327,30 @@ class Simulation:
         for vehicle in self.vehicles:
             vehicle.draw(screen)
 
+        # 绘制SLAM地图
+        if self.selected_vehicle and self.show_slam:
+            self.selected_vehicle.slam.draw(screen, 10, 10, 0.5)
+
+        # 绘制BEV视图
+        if self.show_bev:
+            self.bev_system.render(screen, SCREEN_WIDTH - 410, 10)
+
         # 绘制UI
         self.draw_ui()
 
         # 更新显示
         pygame.display.flip()
 
+
     def draw_ui(self):
         # 绘制模式指示器
+        global info_text
         mode_text = f"模式: {self.edit_mode} (1-5切换)"
         mode_surface = font.render(mode_text, True, BLACK)
         screen.blit(mode_surface, (10, 10))
 
         # 绘制控制提示
-        controls_text = "空格: 暂停/继续 | S: 切换传感器显示 | P: 切换预测显示 | L: 左转信号 | 右键: 添加路径点"
+        controls_text = "空格: 暂停/继续 | S: 传感器显示 | P: 预测显示 | M: SLAM显示 | B: BEV显示 | D: PID显示 | V: BEV模式 | R: 重置PID | L: 左转信号 | 右键: 添加路径点"
         controls_surface = font.render(controls_text, True, BLACK)
         screen.blit(controls_surface, (10, 40))
 
@@ -1438,6 +2360,7 @@ class Simulation:
         screen.blit(status_surface, (10, 70))
 
         # 绘制选中的车辆信息
+        info_text = ""
         if self.selected_vehicle:
             info_text = f"选中车辆 | 速度: {self.selected_vehicle.dynamics.velocity:.1f} | 角度: {self.selected_vehicle.angle:.1f}"
             info_surface = font.render(info_text, True, BLUE)
@@ -1454,6 +2377,26 @@ class Simulation:
                 risk_surface = font.render(risk_text, True, RED)
                 screen.blit(risk_surface, (SCREEN_WIDTH - 250, 70))
 
+            # 显示SLAM状态
+            slam_text = f"SLAM状态: {self.selected_vehicle.slam.state.name}"
+            slam_surface = font.render(slam_text, True, PURPLE)
+            screen.blit(slam_surface, (SCREEN_WIDTH - 250, 100))
+
+            # 显示PID信息
+            if self.show_pid:
+                pid_info = self.selected_vehicle.pid_debug_info
+                speed_text = f"速度PID: P={pid_info['speed']['p_term']:.1f} I={pid_info['speed']['i_term']:.1f} D={pid_info['speed']['d_term']:.1f}"
+                steering_text = f"转向PID: P={pid_info['steering']['p_term']:.1f} I={pid_info['steering']['i_term']:.1f} D={pid_info['steering']['d_term']:.1f}"
+                brake_text = f"刹车PID: P={pid_info['brake']['p_term']:.1f} I={pid_info['brake']['i_term']:.1f} D={pid_info['brake']['d_term']:.1f}"
+
+                speed_surface = font.render(speed_text, True, GREEN)
+                steering_surface = font.render(steering_text, True, BLUE)
+                brake_surface = font.render(brake_text, True, RED)
+
+                screen.blit(speed_surface, (SCREEN_WIDTH - 250, 130))
+                screen.blit(steering_surface, (SCREEN_WIDTH - 250, 150))
+                screen.blit(brake_surface, (SCREEN_WIDTH - 250, 170))
+
         # 绘制暂停指示
         if self.paused:
             pause_surface = large_font.render("已暂停", True, RED)
@@ -1469,9 +2412,25 @@ class Simulation:
         sensor_surface = font.render(sensor_text, True, CYAN)
         screen.blit(sensor_surface, (10, 130))
 
+        # 绘制SLAM显示状态
+        slam_text = f"SLAM显示: {'开启' if self.show_slam else '关闭'}"
+        slam_surface = font.render(slam_text, True, MAGENTA)
+        screen.blit(slam_surface, (10, 160))
+
+        # 绘制BEV显示状态
+        # bev_text = f"BEV显示: {'开启' if self.show_bev else '关闭'}"
+        # bev_surface = font.render(bev_text, True, GREEN)
+        # screen.blit(bev_surface, (10, 190))
+
+        # 绘制PID显示状态
+        pid_text = f"PID: {'开启' if self.show_pid else '关闭'}"
+        pid_surface = font.render(pid_text, True, ORANGE)
+        screen.blit(pid_surface, (10, 190))
+
+
     def run(self):
         while self.running:
-            self.dt = self.clock.tick(60) / 1000.0  # 转换为秒
+            self.dt = self.clock.tick(60) / 1000.0
 
             self.handle_events()
             self.update()
