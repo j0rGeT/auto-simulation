@@ -1,0 +1,10 @@
+[project]
+name = "auto-simulation"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=2.2.6",
+    "pygame>=2.6.1",
+    "pyopengl>=3.1.10",
+]
